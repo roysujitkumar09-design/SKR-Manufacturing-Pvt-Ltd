@@ -1,1 +1,307 @@
+'use strict';
+/* SKR Manufacturing ERP - app.js
+   Vanilla JS, data persisted in localStorage, Chart.js for dashboards.
+   Demo login: admin@skrmfg.in / admin123 */
 
+/* ---------- Helpers ---------- */
+const KEY = 'skr_erp_v1', PG = 8, AUTH = { e: 'admin@skrmfg.in', p: 'admin123' };
+const $ = (s, r = document) => r.querySelector(s), $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const inr = n => '₹' + (+n || 0).toLocaleString('en-IN', { maximumFractionDigits: 0 });
+const num = n => (+n || 0).toLocaleString('en-IN');
+const sum = (a, k) => a.reduce((t, r) => t + (+r[k] || 0), 0);
+const ymd = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+const ago = n => ymd(new Date(Date.now() - n * 864e5)), today = () => ago(0);
+let DB, route = 'dashboard', charts = [], ST = {}, CONF = null;
+
+/* ---------- Sample data ---------- */
+function seed() {
+  const P = [['Industrial Fasteners', 3000, 12, 'Steel Wire', .05], ['Packaging Boxes', 2000, 35, 'Corrugated Board', .4], ['Plastic Components', 2500, 48, 'PVC Granules', .08], ['Electrical Parts', 1500, 120, 'Copper Wire', .02]];
+  const S = ['ABC Metals', 'Bengal Packaging', 'Eastern Chemicals'], C = ['ABC Traders', 'XYZ Enterprises', 'Kolkata Industrial Supply'], O = ['Rakesh Das', 'Anita Roy', 'Suman Ghosh'];
+  const id = (p, n) => p + String(n).padStart(3, '0');
+  const mats = [['Steel Wire', 'kg', 1200, 500, 0], ['Aluminium Sheet', 'sheet', 300, 400, 0], ['Corrugated Board', 'sheet', 2000, 800, 1], ['Kraft Paper', 'kg', 150, 300, 1], ['PVC Granules', 'kg', 900, 400, 2], ['ABS Resin', 'kg', 600, 500, 2], ['Copper Wire', 'kg', 80, 100, 0]];
+  const t = n => new Date(Date.now() - n * 36e5).toISOString();
+  return {
+    products: P.map(p => ({ name: p[0], opening: p[1], rate: p[2], mat: p[3], ratio: p[4] })),
+    suppliers: S,
+    materials: mats.map((m, i) => ({ id: id('RM-', i + 1), name: m[0], unit: m[1], stock: m[2], reorder: m[3], supplier: S[m[4]] })),
+    production: [...Array(16)].map((_, i) => ({ id: id('BN-', 16 - i), date: ago(i >> 1), product: P[i % 4][0], qty: 150 + i * 83 % 250, operator: O[i % 3], notes: i % 5 ? '' : 'Quality check passed' })),
+    sales: [...Array(18)].map((_, i) => { const p = P[i % 4], q = 100 + i * 137 % 400, a = q * p[2]; return { id: id('INV-', 18 - i), date: ago(i * 10), customer: C[i % 3], product: p[0], qty: q, rate: p[2], gst: 18, amount: a, total: +(a * 1.18).toFixed(2), status: ['Paid', 'Pending', 'Paid', 'Partial'][i % 4] }; }),
+    customers: C.map((n, i) => ({ id: id('CU-', i + 1), name: n, phone: '+91 98300 0' + (1000 + i * 111), email: n.split(' ')[0].toLowerCase() + '@example.com', address: ['Burrabazar', 'Salt Lake Sector V', 'Dum Dum'][i] + ', Kolkata', gst: '19AAAC' + (1234 + i) + 'A1Z' + (5 + i), outstanding: [18500, 0, 42000][i] })),
+    purchases: [...Array(8)].map((_, i) => { const m = mats[i % 7], q = 40 + i * 37 % 120, pr = [62, 48, 38, 70, 80, 95, 720, 55][i]; return { id: id('PO-', 8 - i), date: ago(i * 20), supplier: S[m[4]], material: m[0], qty: q, price: pr, total: q * pr }; }),
+    activity: [{ t: t(1), u: 'Admin', m: 'Added production batch BN-016' }, { t: t(5), u: 'Admin', m: 'Generated invoice INV-018' }, { t: t(26), u: 'Admin', m: 'Purchase PO-008 received from ABC Metals' }, { t: t(50), u: 'Admin', m: 'Stock adjusted for Kraft Paper' }],
+    settings: { name: 'SKR Manufacturing Pvt Ltd', gst: '19AAACS1234K1Z5', phone: '+91 33 4000 1234', email: 'accounts@skrmfg.in', address: 'Plot 21, Industrial Estate, Howrah, West Bengal 711101', logo: '', theme: 'light' }
+  };
+}
+const save = () => localStorage.setItem(KEY, JSON.stringify(DB));
+function load() { try { DB = JSON.parse(localStorage.getItem(KEY)); } catch (e) { } if (!DB) { DB = seed(); save(); } }
+const log = m => { DB.activity.unshift({ t: new Date().toISOString(), u: 'Admin', m }); DB.activity.length = Math.min(DB.activity.length, 40); };
+
+/* ---------- Derived data ---------- */
+const P = n => DB.products.find(p => p.name == n);
+const fg = () => DB.products.map(p => {
+  const pr = sum(DB.production.filter(r => r.product == p.name), 'qty'), so = sum(DB.sales.filter(r => r.product == p.name), 'qty');
+  return { id: p.name, name: p.name, opening: p.opening, produced: pr, sold: so, closing: p.opening + pr - so };
+});
+const closing = n => (fg().find(r => r.name == n) || {}).closing || 0;
+const nextId = m => m.px + String(Math.max(0, ...DB[m.k].map(r => parseInt(r.id.split('-')[1]) || 0)) + 1).padStart(3, '0');
+
+/* ---------- Module definitions (drive tables, forms, validation) ----------
+   f: form fields [key,label,type,options,optional]   c: table columns [key,label,formatter] */
+const sup = () => DB.suppliers, pn = () => DB.products.map(p => p.name), mn = () => DB.materials.map(m => m.name), cn = () => DB.customers.map(c => c.name);
+const bd = (t, c) => `<span class="b ${c}">${t}</span>`;
+const pay = s => bd(s, { Paid: 'ok', Pending: 'bad', Partial: 'warn' }[s]);
+const M = {
+  materials: {
+    t: 'Raw Materials', k: 'materials', px: 'RM-', add: 'Add material',
+    f: [['id', 'Material ID', 'auto'], ['name', 'Material name'], ['unit', 'Unit', 'select', ['kg', 'pcs', 'm', 'ltr', 'sheet']], ['stock', 'Current stock', 'number'], ['reorder', 'Reorder level', 'number'], ['supplier', 'Supplier', 'select', sup]],
+    c: [['id', 'ID'], ['name', 'Material'], ['unit', 'Unit'], ['stock', 'Stock', r => num(r.stock)], ['reorder', 'Reorder level', r => num(r.reorder)], ['supplier', 'Supplier'], ['s', 'Status', r => r.stock <= r.reorder ? bd('Low stock', 'bad') : bd('In stock', 'ok')]],
+    flt: ['Status', () => ['Low stock', 'In stock'], (r, v) => (r.stock <= r.reorder) == (v == 'Low stock')],
+    x: [['adj', 'Adjust stock']]
+  },
+  production: {
+    t: 'Production', k: 'production', px: 'BN-', add: 'Production entry',
+    tb: '<button class="btn o" data-a="go" data-id="reports">Daily report</button>',
+    f: [['id', 'Batch number', 'auto'], ['date', 'Date', 'date'], ['product', 'Product name', 'select', pn], ['qty', 'Quantity produced', 'number'], ['operator', 'Operator name'], ['notes', 'Notes', 'textarea', 0, 1]],
+    c: [['id', 'Batch'], ['date', 'Date'], ['product', 'Product'], ['qty', 'Qty', r => num(r.qty)], ['operator', 'Operator'], ['notes', 'Notes']],
+    def: () => ({ date: today() }),
+    flt: ['Product', pn, (r, v) => r.product == v],
+    // Consume raw material according to each product's usage ratio
+    hook: (r, o) => { const p = P(r.product), m = DB.materials.find(x => x.name == p.mat); if (m) m.stock = Math.max(0, +(m.stock - (r.qty - (o ? o.qty : 0)) * p.ratio).toFixed(2)); }
+  },
+  fg: {
+    t: 'Finished Goods', rows: fg,
+    c: [['name', 'Product'], ['opening', 'Opening stock', r => num(r.opening)], ['produced', 'Produced', r => '+' + num(r.produced)], ['sold', 'Sold', r => '−' + num(r.sold)], ['closing', 'Closing stock', r => `<b>${num(r.closing)}</b>`]],
+    x: [['open', 'Set opening']]
+  },
+  sales: {
+    t: 'Sales', k: 'sales', px: 'INV-', add: 'New sale',
+    def: () => ({ date: today(), rate: DB.products[0].rate, gst: 18, status: 'Pending' }),
+    f: [['id', 'Invoice number', 'auto'], ['date', 'Date', 'date'], ['customer', 'Customer name', 'select', cn], ['product', 'Product', 'select', pn], ['qty', 'Quantity', 'number'], ['rate', 'Unit rate (₹)', 'number'], ['gst', 'GST %', 'select', [0, 5, 12, 18, 28]], ['status', 'Payment status', 'select', ['Paid', 'Pending', 'Partial']]],
+    c: [['id', 'Invoice'], ['date', 'Date'], ['customer', 'Customer'], ['product', 'Product'], ['qty', 'Qty'], ['amount', 'Amount', r => inr(r.amount)], ['gst', 'GST', r => inr(r.total - r.amount)], ['total', 'Total', r => `<b>${inr(r.total)}</b>`], ['status', 'Payment', r => pay(r.status)]],
+    flt: ['Payment', () => ['Paid', 'Pending', 'Partial'], (r, v) => r.status == v],
+    x: [['inv', 'Invoice']],
+    calc: r => { r.amount = r.qty * r.rate; r.total = +(r.amount * (1 + r.gst / 100)).toFixed(2); },
+    chk: (r, o) => r.qty > closing(r.product) + (o && o.product == r.product ? o.qty : 0) ? `Only ${num(closing(r.product))} units of ${r.product} are in stock.` : '',
+    hook: (r, o) => { const c = DB.customers.find(x => x.name == r.customer); if (!o && c && r.status != 'Paid') c.outstanding += r.total; }
+  },
+  customers: {
+    t: 'Customers', k: 'customers', px: 'CU-', add: 'Add customer',
+    f: [['id', 'Customer ID', 'auto'], ['name', 'Customer name'], ['phone', 'Phone', 'tel'], ['email', 'Email', 'email', 0, 1], ['address', 'Address', 'textarea', 0, 1], ['gst', 'GST number', 'text', 0, 1], ['outstanding', 'Outstanding balance (₹)', 'number']],
+    c: [['name', 'Customer', r => `<b>${esc(r.name)}</b><br><small class="mut">${r.id}</small>`], ['phone', 'Phone'], ['email', 'Email'], ['gst', 'GST no.'], ['outstanding', 'Outstanding', r => r.outstanding > 0 ? bd(inr(r.outstanding), 'bad') : bd('Clear', 'ok')]],
+    flt: ['Dues', () => ['Outstanding', 'Clear'], (r, v) => (r.outstanding > 0) == (v == 'Outstanding')],
+    x: [['pay', 'Receive payment']]
+  },
+  purchases: {
+    t: 'Purchases', k: 'purchases', px: 'PO-', add: 'New purchase',
+    def: () => ({ date: today() }),
+    f: [['id', 'Purchase number', 'auto'], ['date', 'Date', 'date'], ['supplier', 'Supplier', 'select', sup], ['material', 'Material', 'select', mn], ['qty', 'Quantity', 'number'], ['price', 'Price per unit (₹)', 'number']],
+    c: [['id', 'PO'], ['date', 'Date'], ['supplier', 'Supplier'], ['material', 'Material'], ['qty', 'Qty'], ['price', 'Price', r => inr(r.price)], ['total', 'Total', r => `<b>${inr(r.total)}</b>`]],
+    flt: ['Supplier', sup, (r, v) => r.supplier == v],
+    calc: r => r.total = r.qty * r.price,
+    // Received purchases increase raw material stock
+    hook: (r, o) => { const m = DB.materials.find(x => x.name == r.material); if (m) m.stock += r.qty - (o ? o.qty : 0); }
+  }
+};
+const NAV = [
+  ['dashboard', 'Dashboard', 'M3 3h7v7H3zM14 3h7v7h-7zM14 14h7v7h-7zM3 14h7v7H3z'],
+  ['materials', 'Raw Materials', 'M21 8l-9-5-9 5v8l9 5 9-5zM3 8l9 5 9-5M12 13v8'],
+  ['production', 'Production', 'M2 20V8l6 4V8l6 4V4h4v16z'],
+  ['fg', 'Finished Goods', 'M16.5 9.4l-9-5.2M21 16V8l-9-5-9 5v8l9 5zM3.3 7L12 12l8.7-5M12 22V12'],
+  ['sales', 'Sales', 'M23 6l-9.5 9.5-5-5L1 18M17 6h6v6'],
+  ['customers', 'Customers', 'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8M23 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8'],
+  ['purchases', 'Purchases', 'M6 6h15l-1.5 9h-12zM6 6L5 2H2M9 20a1 1 0 1 0 0 .01M18 20a1 1 0 1 0 0 .01'],
+  ['reports', 'Reports', 'M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8zM14 2v6h6M8 13h8M8 17h8'],
+  ['settings', 'Settings', 'M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6']
+];
+
+/* ---------- UI primitives: toast, modal, forms ---------- */
+function toast(m, t = 'ok') { const e = document.createElement('div'); e.className = 't ' + t; e.textContent = m; $('#toasts').append(e); setTimeout(() => e.remove(), 3200); }
+const modal = h => { $('#modal').innerHTML = `<div class="mo">${h}</div>`; }, closeM = () => { $('#modal').innerHTML = ''; };
+const busy = (ms, cb) => { const l = $('#loader'); l.classList.remove('off'); setTimeout(() => { cb(); l.classList.add('off'); }, ms); };
+function ask(msg, cb) { CONF = cb; modal(`<div class="md sm"><h3>Please confirm</h3><p>${esc(msg)}</p><div class="ft"><button class="btn o" data-x>Cancel</button><button class="btn d" data-a="yes">Delete</button></div></div>`); }
+
+function openForm(title, F, v, ok) {
+  const L = o => typeof o == 'function' ? o() : o;
+  modal(`<div class="md"><h3>${esc(title)}</h3><form>${F.map(([k, l, t = 'text', o, opt]) => `<label>${l}${t == 'select'
+    ? `<select name="${k}">${L(o).map(x => `<option ${x == v[k] ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select>`
+    : t == 'textarea' ? `<textarea name="${k}" rows="2">${esc(v[k])}</textarea>`
+      : `<input name="${k}" type="${t == 'auto' ? 'text' : t}" value="${esc(v[k])}" ${t == 'auto' ? 'readonly' : opt ? '' : 'required'} ${t == 'number' ? 'step="any" min="0"' : ''}>`}</label>`).join('')}
+    <div class="ft"><button type="button" class="btn o" data-x>Cancel</button><button class="btn p">Save</button></div></form></div>`);
+  const f = $('#modal form'), E = f.elements;
+  f.onchange = e => { if (e.target.name == 'product' && E.rate) E.rate.value = P(e.target.value).rate; }; // auto-fill unit rate
+  f.onsubmit = e => { e.preventDefault(); const d = {}; F.forEach(([k, , t, o]) => { let x = E[k].value; if (t == 'number' || (Array.isArray(o) && typeof o[0] == 'number')) x = +x; d[k] = x; }); ok(d); };
+}
+
+/* ---------- Generic CRUD ---------- */
+const openAdd = k => { const m = M[k]; openForm(m.add, m.f, { ...(m.def ? m.def() : {}), id: nextId(m) }, d => saveRec(k, d)); };
+function saveRec(k, d, id) {
+  const m = M[k], a = DB[k], o = id && a.find(r => r.id == id), r = { ...o, ...d };
+  m.calc && m.calc(r);
+  const e = m.chk && m.chk(r, o); if (e) return toast(e, 'bad');
+  m.hook && m.hook(r, o);
+  o ? Object.assign(o, r) : a.unshift(r);
+  log((o ? 'Updated ' : 'Added ') + m.t.toLowerCase() + ' ' + r.id); save(); closeM(); draw(k); toast((o ? 'Updated ' : 'Saved ') + r.id);
+}
+
+/* ---------- Module page: search, filter, table, pagination ---------- */
+function page(k) {
+  const m = M[k], s = ST[k] = ST[k] || { q: '', f: '', p: 1 };
+  $('#view').innerHTML = `<div class="head"><div><h2>${m.t}</h2><p class="mut" id="cnt"></p></div><div class="tools">${m.tb || ''}${m.add ? `<button class="btn p" data-a="add">+ ${m.add}</button>` : ''}</div></div>
+  <div class="card"><div class="bar"><input id="q" placeholder="Search ${m.t.toLowerCase()}…" value="${esc(s.q)}" aria-label="Search">${m.flt ? `<select id="fl" aria-label="Filter"><option value="">All ${m.flt[0].toLowerCase()}</option>${m.flt[1]().map(x => `<option ${x == s.f ? 'selected' : ''}>${esc(x)}</option>`).join('')}</select>` : ''}</div><div id="tbl"></div></div>`;
+  $('#q').oninput = e => { s.q = e.target.value; s.p = 1; draw(k); };
+  if (m.flt) $('#fl').onchange = e => { s.f = e.target.value; s.p = 1; draw(k); };
+  draw(k);
+}
+function draw(k) {
+  const m = M[k], s = ST[k], q = s.q.toLowerCase();
+  const R = (m.rows ? m.rows() : DB[k]).filter(r => (!q || Object.values(r).join(' ').toLowerCase().includes(q)) && (!s.f || m.flt[2](r, s.f)));
+  const n = Math.max(1, Math.ceil(R.length / PG)); s.p = Math.min(s.p, n);
+  $('#cnt').textContent = R.length + ' records';
+  const btn = (a, l, c, id) => `<button class="btn ${c} s" data-a="${a}" data-id="${esc(id)}">${l}</button>`;
+  $('#tbl').innerHTML = `<div class="tw"><table><thead><tr>${m.c.map(c => `<th>${c[1]}</th>`).join('')}<th></th></tr></thead><tbody>${R.slice((s.p - 1) * PG, s.p * PG).map(r => `<tr>${m.c.map(c => `<td>${c[2] ? c[2](r) : esc(r[c[0]])}</td>`).join('')}<td class="ac">${(m.x || []).map(x => btn(x[0], x[1], 'o', r.id)).join('')}${m.f ? btn('edit', 'Edit', 'o', r.id) + btn('del', 'Delete', 'd', r.id) : ''}</td></tr>`).join('') || '<tr><td colspan="9" class="mut">No records match. Try a different search or filter.</td></tr>'}</tbody></table></div>
+  <div class="pg"><span class="mut">Page ${s.p} of ${n}</span><div><button class="btn o s" data-a="pv" ${s.p < 2 ? 'disabled' : ''}>Previous</button><button class="btn o s" data-a="nx" ${s.p >= n ? 'disabled' : ''}>Next</button></div></div>`;
+}
+
+/* ---------- Dashboard ---------- */
+function count(el) {
+  const to = +el.dataset.v, cur = el.dataset.c == '1', t0 = performance.now();
+  (function f(t) { const p = Math.min(1, (t - t0) / 900); el.textContent = (cur ? '₹' : '') + Math.round(to * (1 - Math.pow(1 - p, 3))).toLocaleString('en-IN'); if (p < 1) requestAnimationFrame(f); })(t0);
+}
+function dash() {
+  const td = today(), mo = td.slice(0, 7), sa = DB.sales, low = DB.materials.filter(m => m.stock <= m.reorder);
+  const K = [['Total raw materials', sum(DB.materials, 'stock'), 0, 'units across ' + DB.materials.length + ' items', 'pri'], ['Total finished goods', sum(fg(), 'closing'), 0, 'units ready to ship', 'ok'], ["Today's production", sum(DB.production.filter(r => r.date == td), 'qty'), 0, 'units today', 'ok'], ['Monthly sales', sum(sa.filter(r => r.date.startsWith(mo)), 'total'), 1, 'this month, incl. GST', 'warn'], ['Total orders', sa.length, 0, 'all invoices', 'pri'], ['Pending orders', sa.filter(r => r.status != 'Paid').length, 0, 'awaiting full payment', 'bad'], ['Profit', sum(sa, 'amount') - sum(DB.purchases, 'total'), 1, 'sales less purchases', 'ok']];
+  const QA = [['New production', 'production:add'], ['New sale', 'sales:add'], ['Add material', 'materials:add'], ['New purchase', 'purchases:add'], ['Add customer', 'customers:add'], ['Reports', 'reports']];
+  $('#view').innerHTML = `<div class="head"><div><h2>Plant overview</h2><p class="mut">How production, stock and sales stand right now.</p></div><div class="tools">${QA.map(q => `<button class="btn o s" data-a="go" data-id="${q[1]}">${q[0]}</button>`).join('')}</div></div>
+  <div class="kpis">${K.map(k => `<div class="card kpi ${k[4]}"><span class="mut">${k[0]}</span><b data-v="${k[1]}" data-c="${k[2]}">0</b><small class="mut">${k[3]}</small></div>`).join('')}</div>
+  <div class="cg"><div class="card"><h3>Daily production</h3><div class="cv"><canvas id="c1"></canvas></div></div><div class="card"><h3>Monthly sales</h3><div class="cv"><canvas id="c2"></canvas></div></div><div class="card"><h3>Inventory consumption</h3><div class="cv"><canvas id="c3"></canvas></div></div></div>
+  <div class="cg2"><div class="card"><h3>Recent activities</h3><div class="tw"><table><thead><tr><th>When</th><th>User</th><th>Activity</th></tr></thead><tbody>${DB.activity.slice(0, 6).map(a => `<tr><td>${new Date(a.t).toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}</td><td>${a.u}</td><td>${esc(a.m)}</td></tr>`).join('')}</tbody></table></div></div>
+  <div class="card"><h3>Low stock alerts</h3>${low.map(m => `<div class="ls"><div><b>${esc(m.name)}</b><br><small class="mut">${num(m.stock)} ${m.unit} left, reorder at ${num(m.reorder)}</small></div>${bd('Low', 'bad')}<div class="pr"><i style="width:${Math.min(100, m.stock / m.reorder * 100)}%"></i></div></div>`).join('') || '<p class="mut">All materials are above their reorder level.</p>'}</div></div>`;
+  $$('.kpi b').forEach(count);
+  if (!window.Chart) return toast('Charts need an internet connection to load Chart.js', 'warn');
+  const acc = getComputedStyle(document.documentElement).getPropertyValue('--acc').trim(), opt = { responsive: true, maintainAspectRatio: false, animation: { duration: 1200, easing: 'easeOutQuart' }, plugins: { legend: { display: false } } };
+  const days = [...Array(7)].map((_, i) => ago(6 - i)), now = new Date();
+  const mons = [...Array(6)].map((_, i) => ymd(new Date(now.getFullYear(), now.getMonth() - 5 + i, 1)).slice(0, 7));
+  const use = {}; DB.production.forEach(r => { const p = P(r.product); if (p) use[p.mat] = (use[p.mat] || 0) + r.qty * p.ratio; });
+  const mk = (id, cfg) => charts.push(new Chart($(id), cfg));
+  mk('#c1', { type: 'line', data: { labels: days.map(d => d.slice(5)), datasets: [{ data: days.map(d => sum(DB.production.filter(r => r.date == d), 'qty')), borderColor: acc, backgroundColor: acc + '26', fill: true, tension: .4 }] }, options: opt });
+  mk('#c2', { type: 'bar', data: { labels: mons, datasets: [{ data: mons.map(m => Math.round(sum(sa.filter(r => r.date.startsWith(m)), 'total'))), backgroundColor: '#10B981', borderRadius: 8 }] }, options: opt });
+  mk('#c3', { type: 'doughnut', data: { labels: Object.keys(use), datasets: [{ data: Object.values(use).map(Math.round), backgroundColor: ['#1E3A8A', '#10B981', '#F59E0B', '#EF4444', '#6366F1'], borderWidth: 0 }] }, options: { ...opt, plugins: { legend: { display: true, position: 'bottom' } } } });
+}
+
+/* ---------- Reports ---------- */
+function repData(t, d) {
+  const mo = d.slice(0, 7), pr = DB.production, sl = DB.sales.filter(r => r.date.startsWith(mo));
+  if (t == 'dp') return [`Daily Production Report, ${d}`, ['Batch', 'Product', 'Quantity', 'Operator', 'Notes'], pr.filter(r => r.date == d).map(r => [r.id, r.product, r.qty, r.operator, r.notes])];
+  if (t == 'mp') return [`Monthly Production Report, ${mo}`, ['Product', 'Batches', 'Quantity'], DB.products.map(p => { const x = pr.filter(r => r.product == p.name && r.date.startsWith(mo)); return [p.name, x.length, sum(x, 'qty')]; })];
+  if (t == 'inv') return ['Inventory Report, ' + d, ['Item', 'Type', 'Stock', 'Status'], [...DB.materials.map(m => [m.name, 'Raw material', m.stock + ' ' + m.unit, m.stock <= m.reorder ? 'Low stock' : 'OK']), ...fg().map(f => [f.name, 'Finished good', f.closing, 'OK'])]];
+  if (t == 'sl') return [`Sales Report, ${mo}`, ['Invoice', 'Date', 'Customer', 'Product', 'Qty', 'Total', 'Payment'], sl.map(r => [r.id, r.date, r.customer, r.product, r.qty, inr(r.total), r.status])];
+  const rev = sum(sl, 'amount'), gst = sum(sl, 'total') - rev, cost = sum(DB.purchases.filter(r => r.date.startsWith(mo)), 'total');
+  return [`Profit & Loss Report, ${mo}`, ['Particular', 'Amount'], [['Sales revenue', inr(rev)], ['GST collected', inr(gst)], ['Purchases (cost)', inr(cost)], ['Gross profit', inr(rev - cost)]]];
+}
+function reps() {
+  const s = ST.rep = ST.rep || { t: 'dp', d: today() }, T = { dp: 'Daily Production', mp: 'Monthly Production', inv: 'Inventory', sl: 'Sales', pl: 'Profit & Loss' };
+  $('#view').innerHTML = `<div class="head"><div><h2>Reports</h2><p class="mut">Pick a report and date, then export or print.</p></div><div class="tools"><button class="btn o" data-a="pdf">PDF</button><button class="btn o" data-a="xls">Excel</button><button class="btn p" data-a="prn">Print</button></div></div>
+  <div class="card bar"><select id="rt">${Object.entries(T).map(([k, v]) => `<option value="${k}" ${k == s.t ? 'selected' : ''}>${v} report</option>`).join('')}</select><input type="date" id="rd" value="${s.d}"></div>
+  <div class="card print-area" id="rep"></div>`;
+  const fill = () => { const [t, h, r] = repData(s.t, s.d), S = DB.settings; $('#rep').innerHTML = `<h3>${esc(S.name)}</h3><p class="mut">${esc(S.address)}, GSTIN ${esc(S.gst)}</p><h2 style="margin:1rem 0">${esc(t)}</h2><div class="tw"><table><thead><tr>${h.map(x => `<th>${x}</th>`).join('')}</tr></thead><tbody>${r.map(x => `<tr>${x.map(c => `<td>${esc(c)}</td>`).join('')}</tr>`).join('') || '<tr><td colspan="9" class="mut">No records for this period.</td></tr>'}</tbody></table></div>`; };
+  $('#rt').onchange = e => { s.t = e.target.value; fill(); }; $('#rd').onchange = e => { s.d = e.target.value || today(); fill(); }; fill();
+}
+
+/* ---------- Invoice layout ---------- */
+function invoice(r) {
+  const s = DB.settings, c = DB.customers.find(x => x.name == r.customer) || {}, g = r.total - r.amount;
+  modal(`<div class="md wide"><div class="print-area inv"><div class="ih"><div>${s.logo ? `<img class="lg" src="${s.logo}" alt="">` : ''}<h3>${esc(s.name)}</h3><small>${esc(s.address)}<br>GSTIN ${esc(s.gst)}, ${esc(s.phone)}</small></div><div><h2>TAX INVOICE</h2><small>${r.id}<br>Date ${r.date}</small><br>${pay(r.status)}</div></div>
+  <p><b>Bill to</b><br>${esc(r.customer)}<br><small>${esc(c.address || '')}<br>GSTIN ${esc(c.gst || 'Not provided')}</small></p><br>
+  <table><thead><tr><th>Product</th><th>Qty</th><th>Rate</th><th>Amount</th></tr></thead><tbody><tr><td>${esc(r.product)}</td><td>${r.qty}</td><td>${inr(r.rate)}</td><td>${inr(r.amount)}</td></tr></tbody></table>
+  <div class="tot"><div><span>Subtotal</span><span>${inr(r.amount)}</span></div><div><span>GST ${r.gst}%</span><span>${inr(g)}</span></div><div><b>Total</b><b>${inr(r.total)}</b></div></div></div>
+  <div class="ft"><button class="btn o" data-x>Close</button><button class="btn p" data-a="prn">Print or save as PDF</button></div></div>`);
+}
+
+/* ---------- Settings ---------- */
+function sets() {
+  const s = DB.settings;
+  $('#view').innerHTML = `<div class="head"><div><h2>Settings</h2><p class="mut">Company profile and appearance</p></div></div><form class="card fg2" id="sf">
+  ${[['name', 'Company name'], ['gst', 'GST number'], ['phone', 'Phone'], ['email', 'Email']].map(([k, l]) => `<label>${l}<input name="${k}" value="${esc(s[k])}"></label>`).join('')}
+  <label class="full">Address<textarea name="address" rows="2">${esc(s.address)}</textarea></label>
+  <label>Logo<input type="file" name="logo" accept="image/*"></label>
+  <label>Theme<select name="theme"><option value="light">Light</option><option value="dark">Dark</option></select></label>
+  <div class="full"><button class="btn p">Save settings</button></div></form>`;
+  const f = $('#sf'), E = f.elements; E.theme.value = s.theme;
+  f.onsubmit = e => {
+    e.preventDefault();
+    const done = () => { ['name', 'gst', 'phone', 'email', 'address', 'theme'].forEach(k => s[k] = E[k].value); log('Updated company settings'); save(); theme(); brand(); toast('Settings saved'); };
+    const fl = E.logo.files[0]; if (fl) { const r = new FileReader(); r.onload = () => { s.logo = r.result; done(); }; r.readAsDataURL(fl); } else done();
+  };
+}
+
+/* ---------- Theme, branding, routing ---------- */
+function theme() {
+  const d = DB.settings.theme == 'dark'; document.documentElement.dataset.theme = DB.settings.theme; $('#tg').textContent = d ? '☀' : '☾';
+  if (window.Chart) { Chart.defaults.color = d ? '#94A3B8' : '#64748B'; Chart.defaults.borderColor = d ? 'rgba(148,163,184,.15)' : 'rgba(30,58,138,.08)'; Chart.defaults.font.family = 'Poppins'; }
+}
+const brand = () => { $('#bn').textContent = DB.settings.name; $('#bl').innerHTML = DB.settings.logo ? `<img src="${DB.settings.logo}" alt="">` : 'SKR'; };
+function render() { charts.forEach(c => c.destroy()); charts = []; ({ dashboard: dash, reports: reps, settings: sets }[route] || (() => page(route)))(); }
+function nav(r) { route = r; $$('.nav a').forEach(a => a.classList.toggle('on', a.dataset.r == r)); $('#ttl').textContent = NAV.find(n => n[0] == r)[1]; $('.side').classList.remove('open'); render(); scrollTo(0, 0); }
+
+/* ---------- Actions (wired through data-a attributes) ---------- */
+const A = {
+  nav, add: () => openAdd(route), go: v => { const [r, a] = v.split(':'); nav(r); a && openAdd(r); },
+  edit: id => { const m = M[route]; openForm('Edit ' + id, m.f, DB[route].find(r => r.id == id), d => saveRec(route, d, id)); },
+  del: id => ask(`Delete ${id}? This cannot be undone.`, () => { DB[route] = DB[route].filter(r => r.id != id); log('Deleted ' + id); save(); draw(route); toast('Deleted ' + id, 'warn'); }),
+  yes: () => { const c = CONF; closeM(); c && c(); },
+  pv: () => { ST[route].p--; draw(route); }, nx: () => { ST[route].p++; draw(route); },
+  menu: () => $('.side').classList.toggle('open'),
+  dark: () => { DB.settings.theme = DB.settings.theme == 'dark' ? 'light' : 'dark'; save(); theme(); render(); },
+  fp: () => { $('#lf').hidden = !$('#lf').hidden; $('#ff').hidden = !$('#ff').hidden; },
+  out: () => { localStorage.removeItem('skr_auth'); sessionStorage.removeItem('skr_auth'); location.reload(); },
+  inv: id => invoice(DB.sales.find(r => r.id == id)),
+  adj: id => {
+    const m = DB.materials.find(r => r.id == id);
+    openForm('Adjust stock: ' + m.name, [['t', 'Adjustment', 'select', ['Add stock', 'Remove stock']], ['q', `Quantity (${m.unit})`, 'number'], ['why', 'Reason']], {}, d => {
+      const n = m.stock + (d.t == 'Add stock' ? d.q : -d.q); if (n < 0) return toast(`You can remove at most ${m.stock} ${m.unit}.`, 'bad');
+      m.stock = n; log(`${d.t} for ${m.name}: ${d.q} ${m.unit} (${d.why})`); save(); closeM(); draw('materials'); toast('Stock updated');
+    });
+  },
+  pay: id => {
+    const c = DB.customers.find(r => r.id == id);
+    openForm('Receive payment: ' + c.name, [['q', 'Amount received (₹)', 'number'], ['mode', 'Mode', 'select', ['UPI', 'Bank transfer', 'Cash', 'Cheque']]], {}, d => {
+      if (d.q > c.outstanding) return toast(`Amount is more than the ${inr(c.outstanding)} outstanding.`, 'bad');
+      c.outstanding -= d.q; log(`Received ${inr(d.q)} from ${c.name} via ${d.mode}`); save(); closeM(); draw('customers'); toast('Payment recorded');
+    });
+  },
+  open: id => { const p = P(id); openForm('Opening stock: ' + id, [['o', 'Opening stock', 'number']], { o: p.opening }, d => { p.opening = d.o; save(); closeM(); draw('fg'); toast('Opening stock updated'); }); },
+  pdf: () => { toast('Choose "Save as PDF" as the destination in the print dialog'); setTimeout(print, 700); },
+  prn: () => print(),
+  xls: () => {
+    const [t, h, r] = repData(ST.rep.t, ST.rep.d), csv = [h, ...r].map(x => x.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
+    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob(['\ufeff' + csv], { type: 'text/csv' })); a.download = t.replace(/\W+/g, '_') + '.csv'; a.click(); toast('Report exported. Open it in Excel.');
+  }
+};
+document.addEventListener('click', e => {
+  if (!e.target.closest('.side,[data-a=menu]')) $('.side').classList.remove('open');
+  if (e.target.matches('.mo') || e.target.closest('[data-x]')) return closeM();
+  const b = e.target.closest('[data-a]'); if (!b) return;
+  if (b.tagName == 'A') e.preventDefault();
+  A[b.dataset.a] && A[b.dataset.a](b.dataset.id);
+});
+document.addEventListener('keydown', e => { if (e.key == 'Escape') closeM(); });
+$('#gs').onkeydown = e => { // global search: jump to first module with a match
+  if (e.key != 'Enter') return; const q = e.target.value.toLowerCase();
+  const k = ['materials', 'customers', 'sales', 'production', 'purchases'].find(k => DB[k].some(r => Object.values(r).join(' ').toLowerCase().includes(q)));
+  k ? (ST[k] = { q: e.target.value, f: '', p: 1 }, nav(k)) : toast(`No match found for "${e.target.value}"`, 'warn');
+};
+
+/* ---------- Auth + boot ---------- */
+function enter() { $('#login').hidden = true; $('.app').hidden = false; brand(); nav('dashboard'); }
+$('#lf').onsubmit = e => {
+  e.preventDefault(); const em = $('#em').value.trim(), rm = $('#rm').checked;
+  if (em == AUTH.e && $('#pw').value == AUTH.p) { (rm ? localStorage : sessionStorage).setItem('skr_auth', '1'); rm ? localStorage.setItem('skr_em', em) : localStorage.removeItem('skr_em'); busy(700, enter); }
+  else toast('Email or password is incorrect. Use Demo login to explore.', 'bad');
+};
+$('#demo').onclick = () => { $('#em').value = AUTH.e; $('#pw').value = AUTH.p; $('#lf').requestSubmit(); };
+$('#ff').onsubmit = e => { e.preventDefault(); toast('Reset link sent. Check your inbox.'); A.fp(); };
+load(); theme();
+$('#nav').innerHTML = NAV.map(n => `<a href="#" data-a="nav" data-id="${n[0]}" data-r="${n[0]}"><svg viewBox="0 0 24 24"><path d="${n[2]}"/></svg>${n[1]}</a>`).join('');
+$('#em').value = localStorage.getItem('skr_em') || '';
+busy(900, () => { if (localStorage.getItem('skr_auth') || sessionStorage.getItem('skr_auth')) enter(); else $('#login').hidden = false; });
