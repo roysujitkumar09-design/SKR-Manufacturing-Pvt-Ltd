@@ -29,7 +29,7 @@
       <label>Password<input id="pw" type="password" required autocomplete="current-password"></label>
       <div class="row"><label class="chk"><input type="checkbox" id="rm"> Remember me</label><a href="#" data-a="fp">Forgot password?</a></div>
       <button class="btn p w">Sign in</button>
-      <button type="button" class="btn o w" id="demo">Demo login</button>
+      <div class="row"><select id="dr" aria-label="Demo role"><option>Admin</option><option>Manager</option><option>Operator</option><option>Accountant</option><option>Viewer</option></select><button type="button" class="btn o" id="demo">Demo login</button></div>
     </form>
     <form id="ff" hidden>
       <h2>Reset password</h2>
@@ -46,6 +46,7 @@
   <aside class="side">
     <div class="brand"><span class="logo" id="bl">SKR</span><b id="bn"></b></div>
     <nav class="nav" id="nav"></nav>
+    <div class="who" id="who"></div>
     <button class="btn o w" data-a="out">Sign out</button>
   </aside>
   <div class="main">
@@ -59,10 +60,13 @@
   </div>
 </div>
 
+<input type="file" id="imp" accept=".xlsx,.xls,.csv" hidden>
 <div id="modal"></div>
 <div id="toasts" aria-live="polite"></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
